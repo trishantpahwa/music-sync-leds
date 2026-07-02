@@ -4,7 +4,8 @@
 */
 
 #include <FastLED.h>
-FASTLED_USING_NAMESPACE
+
+#define DEBUG 0 // Set to 1 for serial debug output (throttled to 10 lines/sec)
 
 #define NUM_LEDS         300 // Total Number of LEDs
 #define DATA_PIN          7 // Connect your Addressable LED Strip to this Pin.
@@ -14,11 +15,12 @@ FASTLED_USING_NAMESPACE
 
 #define BRIGHTNESS      255 // Max brightness (0-255)
 #define SATURATION      255 // Color saturation (0-255)
-#define MIN_VAL           5 // Increased to ignore background signal spikes
-#define MAX_VAL          30 // Drastically lowered: signal of 30 will now be full brightness
-#define NOISE_FLOOR       4 // Increased to filter out background noise (like fans or distant voices)
+#define MIN_VAL          13 // Just above idle signal wobble (0-9 in serial log)
+#define MAX_VAL          38 // Starting scale; auto-gain adapts upward from here
+#define NOISE_FLOOR      12 // Idle signal reaches 9 at current gain, +3 margin
 #define HUE_INIT         10 // Initial color hue
 #define HUE_CHANGE        2 // Hue rotation speed
+#define SAMPLE_WINDOW     5 // ms per frame spent peak-sampling the envelope
 
 /* 
   0   -->   LinearFlowing (Dynamic)   
@@ -36,16 +38,24 @@ int analogVal = 0;
 int val = 0;
 int smoothed = 0;
 int baseline = 0;
+unsigned long lastBaselineRise = 0;
+int peakLevel = MAX_VAL; // Auto-gain: loudest recent signal, decays over ~10 s
+unsigned long lastPeakDecay = 0;
 
 void setup() { 
-  Serial.begin(9600);
+  Serial.begin(115200);
   pinMode(ENVELOPE_PIN, INPUT);
   
   FastLED.addLeds<LED_TYPE, DATA_PIN, COLOR_ORDER>(leds, NUM_LEDS).setCorrection(TypicalLEDStrip);
   FastLED.setBrightness(BRIGHTNESS);
 
-  // Initialize baseline and smoothed with current room noise
-  baseline = analogRead(ENVELOPE_PIN);
+  // Initialize baseline with the ambient PEAK over ~0.5s, not a single read —
+  // a lucky-low single sample would make quiet rooms register as sound.
+  baseline = 0;
+  for (int i = 0; i < 50; i++) {
+    int v = readEnvelopePeak();
+    if (v > baseline) baseline = v;
+  }
   smoothed = baseline;
 
   for(int i = 0; i < NUM_LEDS; i++) {
@@ -55,35 +65,74 @@ void setup() {
   Serial.println("Sound Reactivity Initialized...");
 }
 
+// Sample the envelope as fast as possible for SAMPLE_WINDOW ms and keep the
+// peak, so short transients (kicks, snares) between frames are never missed.
+int readEnvelopePeak() {
+  int peak = 0;
+  unsigned long start = millis();
+  while (millis() - start < SAMPLE_WINDOW) {
+    int v = analogRead(ENVELOPE_PIN);
+    if (v > peak) peak = v;
+  }
+  return peak;
+}
+
 void loop() {
-  int raw = analogRead(ENVELOPE_PIN);
+  int raw = readEnvelopePeak();
 
-  // Asymmetric attack/decay: faster rise for zero delay
+  // Asymmetric attack/decay. Kept light: the Sound Detector's envelope
+  // output is already hardware-smoothed, so heavy software smoothing here
+  // only adds visible lag between the music and the strip.
   if (raw > smoothed)
-    smoothed = (smoothed + raw) / 2; // Instant attack (was 3:1)
+    smoothed = raw; // Truly instant attack — beats register the same frame
   else
-    smoothed = (smoothed * 3 + raw) / 4; // Faster decay (was 7:1)
+    smoothed = (smoothed + raw) / 2; // Fast decay so beats stay punchy
 
-  // Dynamic baseline tracks ambient noise levels
-  if (smoothed < baseline)
+  // Dynamic baseline: follows quiet moments down quickly, creeps up slowly.
+  // Note: a (baseline*31+smoothed)/32 filter can never rise here — integer
+  // division needs smoothed >= baseline+32 to move — so ambient drift above
+  // the boot-time reading would read as permanent "sound". Time-based +1
+  // instead: ambient drift is absorbed within seconds, while music still
+  // pulls the baseline back down in every beat gap before it can be eaten.
+  if (smoothed < baseline) {
     baseline = (baseline * 3 + smoothed) / 4;
-  else
-    baseline = (baseline * 31 + smoothed) / 32; // Slower upward drift for stability
+  } else if (smoothed > baseline && millis() - lastBaselineRise >= 250) {
+    baseline++;
+    lastBaselineRise = millis();
+  }
 
   int signal = smoothed - baseline;
-  
+
+  // Auto-gain: track the loudest recent signal and scale against it, so the
+  // full brightness range is used at any volume or gain-pot setting. Rises
+  // instantly on a new peak, decays ~6% per 250 ms, and never drops below
+  // MAX_VAL so silence-level noise is never amplified up to full scale.
+  if (signal > peakLevel) {
+    peakLevel = signal;
+  } else if (peakLevel > MAX_VAL && millis() - lastPeakDecay >= 250) {
+    peakLevel -= max(1, peakLevel / 16);
+    if (peakLevel < MAX_VAL) peakLevel = MAX_VAL;
+    lastPeakDecay = millis();
+  }
+
   if (signal <= NOISE_FLOOR) {
     analogVal = 0;
   } else {
-    // Map signal to a range we can use for visualization
-    analogVal = constrain(signal, MIN_VAL, MAX_VAL);
+    // Scale so the recent loudest sound maps to MAX_VAL (full effect)
+    analogVal = constrain((int)((long)signal * MAX_VAL / peakLevel), MIN_VAL, MAX_VAL);
   }
 
-  // Debug Output (Commented for zero latency)
-  Serial.print("Raw: "); Serial.print(raw);
-  Serial.print("\tBaseline: "); Serial.print(baseline);
-  Serial.print("\tSignal: "); Serial.print(signal);
-  Serial.print("\tAnalogVal: "); Serial.println(analogVal);
+#if DEBUG
+  static unsigned long lastDebug = 0;
+  if (millis() - lastDebug >= 100) { // Throttled so serial never stalls the frame
+    lastDebug = millis();
+    Serial.print("Raw: "); Serial.print(raw);
+    Serial.print("\tBaseline: "); Serial.print(baseline);
+    Serial.print("\tSignal: "); Serial.print(signal);
+    Serial.print("\tPeak: "); Serial.print(peakLevel);
+    Serial.print("\tAnalogVal: "); Serial.println(analogVal);
+  }
+#endif
 
   switch (STYLE) {
     case 1: LinearReactive(); break;
@@ -98,14 +147,12 @@ void loop() {
 
 void LinearFlowing() {
   val = map(analogVal, MIN_VAL, MAX_VAL, 0, BRIGHTNESS);
-  int dynamicDelay = map(analogVal, MIN_VAL, MAX_VAL, 10, 1); // Reduced max delay to prevent lag
 
   if (val > 0) {
     for (int i = 0; i < NUM_LEDS-1; i++) {
       leds[i] = leds[i+1];
     }
     leds[NUM_LEDS-1] = CHSV(dynamicHue += HUE_CHANGE, SATURATION, val);
-    // Removed blocking delay(max(1, dynamicDelay))
   } else {
     fadeToBlackBy(leds, NUM_LEDS, 20);
   }
@@ -116,7 +163,7 @@ void LinearReactive() {
     fadeToBlackBy(leds, NUM_LEDS, 30);
     return;
   }
-  val = map(analogVal, 0, MAX_VAL, 0, NUM_LEDS);
+  val = map(analogVal, MIN_VAL, MAX_VAL, 0, NUM_LEDS);
   for(int i = 0; i < NUM_LEDS; i++) {
     if (i < val)
       leds[i] = CHSV(HUE_INIT+(HUE_CHANGE*i), SATURATION, BRIGHTNESS);
@@ -126,14 +173,17 @@ void LinearReactive() {
 }
 
 void BrightnessReactive() {
-  if (analogVal <= NOISE_FLOOR + 1) { // Added threshold for complete silence
+  if (analogVal == 0) {
     fadeToBlackBy(leds, NUM_LEDS, 50); // Fast fade to black for crisp transitions
     return;
   }
   
   val = map(analogVal, MIN_VAL, MAX_VAL, 0, BRIGHTNESS);
+  // Gamma correction: perceived LED brightness is nonlinear, so square the
+  // value to make quiet passages visibly dim and loud hits visibly bright
+  val = ((long)val * val) / 255;
   // Rotate the global hue slightly each frame to shift colors over time
-  if (val > 0) dynamicHue += HUE_CHANGE; 
+  if (val > 0) dynamicHue += HUE_CHANGE;
   
   for(int i = 0; i < NUM_LEDS; i++) {
     leds[i] = CHSV(dynamicHue, SATURATION, val);
@@ -164,7 +214,7 @@ void EdgeProgressive() {
     fadeToBlackBy(leds, NUM_LEDS, 30);
     return;
   }
-  val = map(analogVal, 0, MAX_VAL, 0, NUM_LEDS/2);
+  val = map(analogVal, MIN_VAL, MAX_VAL, 0, NUM_LEDS/2);
   for(int i = 0; i < NUM_LEDS/2; i++) {
     int pos1 = i;
     int pos2 = NUM_LEDS - 1 - i;
